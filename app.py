@@ -5,168 +5,154 @@ import time
 import json
 import re
 from PIL import Image
-import io
 
 # --- CONFIGURATION ---
-# Your integrated API Key
 GEMINI_API_KEY = "AIzaSyCEI0mq0NqOzPbuk5PLP_HAMdnqVEWlhYY"
-
-# Configure the SDK immediately
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- Page Config ---
-st.set_page_config(page_title="Gemini Auto-Extractor", layout="wide")
+st.set_page_config(page_title="Gemini Data Extractor Pro", layout="wide")
 
 # --- Initialize Session State ---
 if 'quota_used' not in st.session_state:
     st.session_state.quota_used = 0
 if 'combined_df' not in st.session_state:
     st.session_state.combined_df = None
-if 'debug_logs' not in st.session_state:
-    st.session_state.debug_logs = []
+if 'error_log' not in st.session_state:
+    st.session_state.error_log = []
 
-# --- Constants ---
-BATCH_LIMIT = 30
-PAUSE_TIME = 4 
-DAILY_QUOTA_LIMIT = 1500 
+# --- Helper Functions ---
 
-# --- Sidebar ---
-st.sidebar.title("🛠 Settings & Quota")
-st.sidebar.success("✅ API Key Integrated")
-
-model_choice = st.sidebar.selectbox("Select Model", ["gemini-1.5-flash", "gemini-1.5-pro"])
-
-st.sidebar.subheader("Daily Quota Tracker")
-st.sidebar.progress(min(st.session_state.quota_used / DAILY_QUOTA_LIMIT, 1.0))
-st.sidebar.write(f"Requests used: {st.session_state.quota_used} / {DAILY_QUOTA_LIMIT}")
-
-if st.sidebar.button("Reset App / Clear Data"):
-    st.session_state.combined_df = None
-    st.session_state.debug_logs = []
-    st.session_state.quota_used = 0
-    st.rerun()
-
-# --- Extraction Logic ---
-def clean_json_string(text):
-    """Removes markdown backticks and extra text from AI response."""
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
-    return text.strip()
-
-def extract_from_gemini(image_file):
-    """Sends image to Gemini and returns a list of dictionaries."""
+def find_json_in_text(text):
+    """Extracts JSON array or object from text even if AI adds conversational filler."""
     try:
-        model = genai.GenerativeModel(model_choice)
+        # Look for the first '[' and last ']'
+        match = re.search(r'(\[.*\])', text, re.DOTALL)
+        if match:
+            return match.group(1)
+        # Look for the first '{' and last '}'
+        match = re.search(r'(\{.*\})', text, re.DOTALL)
+        if match:
+            return match.group(1)
+        return text
+    except:
+        return text
+
+def extract_data(image_file, model_name):
+    """Processes image with safety checks and error handling."""
+    try:
+        model = genai.GenerativeModel(model_name)
         img = Image.open(image_file)
         
-        prompt = """
-        Extract all data from this image into a structured JSON array.
-        Rules:
-        1. Return ONLY a valid JSON array of objects (e.g., [{"field": "value"}]).
-        2. Use logical keys (e.g., 'date', 'total', 'item_name', 'quantity').
-        3. If there are multiple rows/items, create one object per item.
-        4. No conversational text, no markdown.
-        """
+        # Optimized Prompt for logic
+        prompt = "Extract all data from this image into a structured JSON array. Return ONLY the JSON. Use clear keys like 'date', 'item', 'total'."
         
         response = model.generate_content([prompt, img])
         
-        if not response.text:
-            return None
-        
-        cleaned_response = clean_json_string(response.text)
-        data = json.loads(cleaned_response)
+        # Check if response was blocked by safety filters
+        if not response.candidates or not response.candidates[0].content.parts:
+            return {"error": f"Image {image_file.name} was blocked by Safety Filters or returned empty."}
+
+        raw_text = response.text
+        clean_json = find_json_in_text(raw_text)
+        data = json.loads(clean_json)
         
         return data if isinstance(data, list) else [data]
-    
-    except Exception as e:
-        st.session_state.debug_logs.append(f"Error in {image_file.name}: {str(e)}")
-        return None
 
-def consolidate_data(results_list):
-    """Merges all extracted dictionaries into one unified logical table."""
-    flat_data = [item for sublist in results_list if sublist for item in sublist]
-    
+    except Exception as e:
+        return {"error": f"Failed {image_file.name}: {str(e)}"}
+
+def consolidate(all_results):
+    """Merges disparate data into one clean table."""
+    flat_data = []
+    for res in all_results:
+        if isinstance(res, list):
+            flat_data.extend(res)
+            
     if not flat_data:
         return pd.DataFrame()
 
     df = pd.DataFrame(flat_data)
-    
-    # Standardize column names
+    # Cleanup column names
     df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
     
-    # Logical mapping to unify similar fields
-    mapping = {
-        'total_amount': 'total', 'grand_total': 'total', 'price': 'total', 'amount': 'total',
-        'date_of_purchase': 'date', 'transaction_date': 'date', 'timestamp': 'date',
-        'vendor': 'merchant', 'store': 'merchant', 'company': 'merchant', 'seller': 'merchant',
-        'description': 'details', 'item': 'details', 'particulars': 'details', 'item_name': 'details'
+    # Logical Merging
+    synonyms = {
+        'total_amount': 'total', 'grand_total': 'total', 'price': 'total', 'amt': 'total',
+        'date_of_purchase': 'date', 'transaction_date': 'date', 'vendor': 'merchant', 
+        'store': 'merchant', 'description': 'details', 'item_name': 'details'
     }
-    
-    df = df.rename(columns=mapping)
-    
-    # Merge duplicate columns (e.g., if we now have two 'total' columns)
+    df = df.rename(columns=synonyms)
+    # Group identical columns together
     df = df.groupby(lambda x: x, axis=1).first()
-    
     return df
 
-# --- Main App Interface ---
-st.title("🌐 Gemini Web Image Tabulator")
-st.write("Upload up to 100 images to extract data into one unified CSV file.")
+# --- UI ---
+st.title("🚀 Robust Image-to-Table Extractor")
+st.sidebar.header("System Status")
+st.sidebar.info("API Key: Loaded")
+model_choice = st.sidebar.selectbox("Brain Level", ["gemini-1.5-flash", "gemini-1.5-pro"])
+st.sidebar.warning("Note: Flash is faster; Pro is smarter.")
 
-files = st.file_uploader("Upload Images (PNG, JPG, JPEG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+if st.sidebar.button("🗑 Clear All Data"):
+    st.session_state.combined_df = None
+    st.session_state.error_log = []
+    st.rerun()
 
-if files:
-    num_files = len(files)
-    if num_files > 100:
-        st.error("Please limit your upload to 100 images.")
-    elif st.button(f"🚀 Process {num_files} Images"):
-        all_extracted_results = []
+uploaded_files = st.file_uploader("Upload up to 100 images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+
+if uploaded_files:
+    if len(uploaded_files) > 100:
+        st.error("Maximum 100 images allowed.")
+    elif st.button(f"Begin Extraction ({len(uploaded_files)} images)"):
+        all_data = []
         progress_bar = st.progress(0)
         status = st.empty()
         
-        for i in range(0, num_files, BATCH_LIMIT):
-            batch = files[i : i + BATCH_LIMIT]
-            status.info(f"Processing Batch {i//BATCH_LIMIT + 1}...")
+        batch_size = 30
+        total = len(uploaded_files)
+
+        for i in range(0, total, batch_size):
+            batch = uploaded_files[i : i + batch_size]
             
-            for img_file in batch:
-                res = extract_from_gemini(img_file)
-                if res:
-                    all_extracted_results.append(res)
+            for idx, img_file in enumerate(batch):
+                status.info(f"Processing image {i + idx + 1} of {total}...")
+                
+                result = extract_data(img_file, model_choice)
+                
+                if isinstance(result, dict) and "error" in result:
+                    st.session_state.error_log.append(result["error"])
+                else:
+                    all_data.append(result)
+                
                 st.session_state.quota_used += 1
+                
+                # CRITICAL: 1.5s delay between images to prevent 15 RPM Rate Limit crash
+                time.sleep(1.5)
             
             # Update Progress
-            progress_bar.progress(min((i + BATCH_LIMIT) / num_files, 1.0))
+            progress_bar.progress(min((i + batch_size) / total, 1.0))
             
-            # Rate Limiter (4s pause for Free Tier)
-            if i + BATCH_LIMIT < num_files:
-                status.warning(f"Rate Limiter: Pausing {PAUSE_TIME}s to prevent API crash...")
-                time.sleep(PAUSE_TIME)
+            # Batch Pause
+            if i + batch_size < total:
+                status.warning("Batch complete. Cooling down for 4 seconds...")
+                time.sleep(4)
 
-        # Final Consolidation
-        status.info("Consolidating all data into unified table...")
-        st.session_state.combined_df = consolidate_data(all_extracted_results)
-        status.success("Processing Complete!")
+        status.success("Consolidating data...")
+        st.session_state.combined_df = consolidate(all_data)
+        status.empty()
 
-# --- Display Results ---
+# --- Results ---
 if st.session_state.combined_df is not None:
     if not st.session_state.combined_df.empty:
-        st.divider()
-        st.subheader("📊 Unified Data Table")
+        st.subheader("📋 Consolidated Table")
         st.dataframe(st.session_state.combined_df, use_container_width=True)
         
-        # Download
         csv = st.session_state.combined_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Data as CSV",
-            data=csv,
-            file_name="gemini_extracted_data.csv",
-            mime="text/csv"
-        )
+        st.download_button("📥 Download CSV", data=csv, file_name="extracted_data.csv")
     else:
-        st.warning("No data found in images. Check Debug Logs below.")
+        st.error("No data could be extracted. See error log below.")
 
-# --- Debug Section ---
-if st.session_state.debug_logs:
-    with st.expander("Show Processing Errors"):
-        for log in st.session_state.debug_logs:
-            st.write(log)
+if st.session_state.error_log:
+    with st.expander("⚠️ View Extraction Errors/Skipped Files"):
+        for err in st.session_state.error_log:
+            st.write(err)
