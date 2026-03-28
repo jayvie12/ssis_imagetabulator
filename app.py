@@ -7,10 +7,11 @@ import re
 from PIL import Image
 
 # --- CONFIGURATION ---
+# Your integrated API Key
 GEMINI_API_KEY = "AIzaSyCEI0mq0NqOzPbuk5PLP_HAMdnqVEWlhYY"
 genai.configure(api_key=GEMINI_API_KEY)
 
-st.set_page_config(page_title="Gemini Data Extractor Pro", layout="wide")
+st.set_page_config(page_title="Gemini Data Extractor", layout="wide")
 
 # --- Initialize Session State ---
 if 'quota_used' not in st.session_state:
@@ -23,156 +24,108 @@ if 'error_log' not in st.session_state:
 # --- Helper Functions ---
 
 def find_json_in_text(text):
-    """Extracts JSON array or object from text even if AI adds conversational filler."""
+    """Clean AI response to find valid JSON."""
     try:
-        # Look for the first '[' and last ']'
         match = re.search(r'(\[.*\])', text, re.DOTALL)
-        if match:
-            return match.group(1)
-        # Fallback to look for the first '{' and last '}'
+        if match: return match.group(1)
         match = re.search(r'(\{.*\})', text, re.DOTALL)
-        if match:
-            return match.group(1)
+        if match: return match.group(1)
         return text
     except:
         return text
 
 def extract_data(image_file, model_name):
-    """Processes image with safety checks and error handling."""
+    """Processes image with model name safety."""
     try:
-        # Initialize model with the specific name
-        model = genai.GenerativeModel(model_name)
+        # We strip 'models/' prefix if it exists to prevent double-prefixing
+        model_id = model_name.replace("models/", "")
+        model = genai.GenerativeModel(model_id)
+        
         img = Image.open(image_file)
         
-        prompt = """
-        Extract all data from this image into a structured JSON array. 
-        Rules:
-        - Return ONLY the JSON.
-        - Use logical keys like 'date', 'item', 'quantity', 'total'.
-        - If multiple rows exist, create a list of objects.
-        """
+        prompt = "Extract all fields from this image into a JSON array. Return ONLY the JSON."
         
-        # Call API
         response = model.generate_content([prompt, img])
         
-        # Check if response has content
         if not response or not hasattr(response, 'text'):
-            return {"error": f"Image {image_file.name} was blocked or returned no content."}
+            return {"error": f"No response for {image_file.name}. Check safety filters."}
 
-        raw_text = response.text
-        clean_json = find_json_in_text(raw_text)
+        clean_json = find_json_in_text(response.text)
         data = json.loads(clean_json)
-        
         return data if isinstance(data, list) else [data]
 
     except Exception as e:
-        # Specific fix for 404: If 'flash' fails, the error message is caught here
         return {"error": f"Error on {image_file.name}: {str(e)}"}
 
 def consolidate(all_results):
-    """Merges all dictionaries into one unified logical table."""
     flat_data = []
     for res in all_results:
-        if isinstance(res, list):
-            flat_data.extend(res)
+        if isinstance(res, list): flat_data.extend(res)
             
-    if not flat_data:
-        return pd.DataFrame()
-
+    if not flat_data: return pd.DataFrame()
     df = pd.DataFrame(flat_data)
-    
-    # Standardize headers
     df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
     
-    # Logical Column Merging (unify similar field names)
+    # Unified Mapping
     synonyms = {
-        'total_amount': 'total', 'grand_total': 'total', 'price': 'total', 'amt': 'total',
-        'date_of_purchase': 'date', 'transaction_date': 'date', 'dt': 'date',
-        'vendor': 'merchant', 'store': 'merchant', 'company': 'merchant',
-        'description': 'details', 'item_name': 'details', 'particulars': 'details'
+        'dams_box_ref_no': 'box_ref', 'unit_code': 'unit_code', 
+        'unit/branch_name': 'branch', 'dis_date': 'disposal_date'
     }
     df = df.rename(columns=synonyms)
-    
-    # Merge duplicate columns created by renaming
-    df = df.groupby(lambda x: x, axis=1).first()
-    return df
+    return df.groupby(lambda x: x, axis=1).first()
 
 # --- UI ---
-st.title("🚀 Robust Image-to-Table Extractor")
+st.title("📸 Data Extractor")
 
-st.sidebar.header("System Settings")
-# Updated model names to be more compatible with the current API
-model_choice = st.sidebar.selectbox(
-    "Select Model Version", 
-    ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest", "gemini-pro-vision"]
-)
+# Model Selection - Using standard stable names
+available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-vision"]
+model_choice = st.sidebar.selectbox("Select Model", available_models)
 
-st.sidebar.info(f"API Key: Active")
-st.sidebar.write(f"Requests used: {st.session_state.quota_used}")
+if st.sidebar.button("Show Available Models"):
+    try:
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        st.sidebar.write(models)
+    except Exception as e:
+        st.sidebar.error(f"Could not list models: {e}")
 
-if st.sidebar.button("🗑 Reset App"):
+if st.sidebar.button("🗑 Reset"):
     st.session_state.combined_df = None
     st.session_state.error_log = []
     st.session_state.quota_used = 0
     st.rerun()
 
-uploaded_files = st.file_uploader("Upload Images (Max 100)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
 if uploaded_files:
-    if len(uploaded_files) > 100:
-        st.error("Please limit to 100 images.")
-    elif st.button(f"Process {len(uploaded_files)} Images"):
+    if st.button(f"Process {len(uploaded_files)} Images"):
         all_data = []
         progress_bar = st.progress(0)
         status = st.empty()
         
-        total = len(uploaded_files)
-        # We process in small batches to stay within free tier limits
-        BATCH_SIZE = 30 
+        for idx, img_file in enumerate(uploaded_files):
+            status.info(f"Processing {idx+1}/{len(uploaded_files)}...")
+            result = extract_data(img_file, model_choice)
+            
+            if isinstance(result, dict) and "error" in result:
+                st.session_state.error_log.append(result["error"])
+            else:
+                all_data.append(result)
+            
+            # Quota/Rate Limit protection
+            st.session_state.quota_used += 1
+            progress_bar.progress((idx + 1) / len(uploaded_files))
+            time.sleep(2.0) # 2s per image is safest for Free Tier
 
-        for i in range(0, total, BATCH_SIZE):
-            batch = uploaded_files[i : i + BATCH_SIZE]
-            
-            for idx, img_file in enumerate(batch):
-                current_num = i + idx + 1
-                status.info(f"Extracting Image {current_num} of {total}...")
-                
-                result = extract_data(img_file, model_choice)
-                
-                if isinstance(result, dict) and "error" in result:
-                    st.session_state.error_log.append(result["error"])
-                else:
-                    all_data.append(result)
-                
-                st.session_state.quota_used += 1
-                
-                # IMPORTANT: Per-image delay to prevent 429/Rate Limit crashes
-                time.sleep(1.8) 
-            
-            # Update Progress Bar
-            progress_bar.progress(min((i + BATCH_SIZE) / total, 1.0))
-            
-            # Batch Delay (4 seconds between every 30 images)
-            if i + BATCH_SIZE < total:
-                status.warning("Batch limit reached. Cooling down for 4 seconds...")
-                time.sleep(4)
-
-        status.success("Consolidating into unified table...")
         st.session_state.combined_df = consolidate(all_data)
-        status.empty()
+        status.success("Done!")
 
-# --- Results ---
 if st.session_state.combined_df is not None:
     if not st.session_state.combined_df.empty:
-        st.subheader("📋 Consolidated Table")
+        st.subheader("📊 Results")
         st.dataframe(st.session_state.combined_df, use_container_width=True)
-        
         csv = st.session_state.combined_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Data (CSV)", data=csv, file_name="extracted_data.csv", mime="text/csv")
-    else:
-        st.error("No data could be extracted. Check error logs below.")
+        st.download_button("📥 Download CSV", data=csv, file_name="data.csv")
 
 if st.session_state.error_log:
-    with st.expander("⚠️ View Errors / Skipped Images"):
-        for err in st.session_state.error_log:
-            st.write(err)
+    with st.expander("⚠️ View Errors"):
+        for err in st.session_state.error_log: st.write(err)
