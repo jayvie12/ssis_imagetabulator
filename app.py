@@ -3,17 +3,20 @@ import google.generativeai as genai
 import pandas as pd
 import time
 import json
+import re
 from PIL import Image
 import io
 
 # --- Page Config ---
-st.set_page_config(page_title="Gemini Web Extractor", layout="wide")
+st.set_page_config(page_title="Gemini Data Extractor Pro", layout="wide")
 
 # --- Initialize Session State ---
 if 'quota_used' not in st.session_state:
     st.session_state.quota_used = 0
 if 'combined_df' not in st.session_state:
     st.session_state.combined_df = None
+if 'debug_logs' not in st.session_state:
+    st.session_state.debug_logs = []
 
 # --- Constants ---
 BATCH_LIMIT = 30
@@ -21,99 +24,151 @@ PAUSE_TIME = 4
 DAILY_QUOTA_LIMIT = 1500 
 
 # --- Sidebar ---
-st.sidebar.title("Configuration")
-api_key = st.sidebar.text_input("Enter Gemini API Key", type="password", help="Get one at aistudio.google.com")
+st.sidebar.title("🛠 Settings & Quota")
+api_key = st.sidebar.text_input("Gemini API Key", type="password")
+model_choice = st.sidebar.selectbox("Select Model", ["gemini-1.5-flash", "gemini-1.5-pro"])
 
 if api_key:
     genai.configure(api_key=api_key)
 
-st.sidebar.subheader("Live Quota Tracker")
-quota_pct = min(st.session_state.quota_used / DAILY_QUOTA_LIMIT, 1.0)
-st.sidebar.progress(quota_pct)
-st.sidebar.write(f"Requests used: {st.session_state.quota_used} / {DAILY_QUOTA_LIMIT}")
+st.sidebar.subheader("Quota Tracker")
+st.sidebar.progress(min(st.session_state.quota_used / DAILY_QUOTA_LIMIT, 1.0))
+st.sidebar.write(f"Used: {st.session_state.quota_used} / {DAILY_QUOTA_LIMIT}")
 
-# --- Helper Functions ---
-def process_image(image_file):
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    img = Image.open(image_file)
-    
-    prompt = """
-    Extract all data from this image into a structured JSON format. 
-    Consolidate similar fields (e.g., use 'total' instead of 'grand_total').
-    Return ONLY the JSON. No markdown formatting.
-    """
-    
+if st.sidebar.button("Clear Data/Logs"):
+    st.session_state.combined_df = None
+    st.session_state.debug_logs = []
+    st.rerun()
+
+# --- Extraction Logic ---
+def clean_json_string(text):
+    """Removes markdown backticks and extra text from AI response."""
+    # Remove markdown code blocks if present
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text)
+    return text.strip()
+
+def extract_from_gemini(image_file):
+    """Sends image to Gemini and returns a list of dictionaries."""
     try:
+        model = genai.GenerativeModel(model_choice)
+        img = Image.open(image_file)
+        
+        prompt = """
+        Act as an OCR and data extraction expert. 
+        Extract all relevant data (names, dates, amounts, ID numbers, table rows, etc.) from this image.
+        
+        Rules:
+        1. Return ONLY a valid JSON array of objects.
+        2. Use consistent keys (e.g., 'date', 'amount', 'item_name').
+        3. If there are multiple items or rows, create an object for each.
+        4. If no data is found, return [].
+        5. DO NOT include any conversational text or explanations.
+        """
+        
         response = model.generate_content([prompt, img])
-        clean_text = response.text.replace('```json', '').replace('```', '').strip()
-        data = json.loads(clean_text)
+        
+        if not response.text:
+            return None
+        
+        cleaned_response = clean_json_string(response.text)
+        data = json.loads(cleaned_response)
+        
+        # Ensure it's always a list
         return data if isinstance(data, list) else [data]
+    
     except Exception as e:
+        st.session_state.debug_logs.append(f"Error in {image_file.name}: {str(e)}")
         return None
 
-def consolidate_data(all_results):
-    flat_list = [item for sublist in all_results if sublist for item in sublist]
-    if not flat_list: return pd.DataFrame()
+def consolidate_data(results_list):
+    """Merges all extracted dictionaries into one clean DataFrame."""
+    # Flatten the list of lists
+    flat_data = [item for sublist in results_list if sublist for item in sublist]
     
-    df = pd.DataFrame(flat_list)
-    # Basic logic to merge similar column names
-    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    if not flat_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(flat_data)
     
-    # Mapping common variations to unified names
-    synonyms = {
-        'total_amount': 'total', 'grand_total': 'total', 'price': 'total',
-        'date_of_purchase': 'date', 'transaction_date': 'date', 'timestamp': 'date',
-        'vendor': 'merchant', 'store_name': 'merchant', 'company': 'merchant'
+    # 1. Standardize column names (lowercase, no spaces)
+    df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
+    
+    # 2. Logic Consolidation Map
+    # This maps common variants found by AI into unified columns
+    mapping = {
+        'total_amount': 'total', 'grand_total': 'total', 'price': 'total', 'amt': 'total',
+        'date_of_purchase': 'date', 'transaction_date': 'date', 'dt': 'date',
+        'vendor': 'merchant', 'store': 'merchant', 'company_name': 'merchant', 'seller': 'merchant',
+        'description': 'details', 'item': 'details', 'particulars': 'details'
     }
-    df = df.rename(columns=synonyms)
-    # Merge columns with same name after renaming
-    df = df.groupby(level=0, axis=1).first() 
+    
+    # Rename columns based on mapping
+    df = df.rename(columns=mapping)
+    
+    # 3. Merge duplicate columns (if 'total' and 'price' both existed, they are now both 'total')
+    # We take the first non-null value for each merged column group
+    df = df.groupby(lambda x: x, axis=1).first()
+    
     return df
 
-# --- Main Interface ---
-st.title("🌐 Gemini Web Image Tabulator")
-st.info("Upload up to 100 images. The app will process them in batches of 30 with a 4s delay to stay within the Free Tier limits.")
+# --- Main App Interface ---
+st.title("📸 Universal Image Data Tabulator")
+st.markdown("""
+This app processes up to 100 images, extracts text into data using Gemini AI, 
+and merges them into a **single logical table**.
+""")
 
-uploaded_files = st.file_uploader("Upload Images (Max 100)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+files = st.file_uploader("Upload Images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
-if uploaded_files:
-    if len(uploaded_files) > 100:
-        st.error("Too many files! Please limit to 100.")
-    elif st.button("🚀 Start Processing"):
+if files:
+    if len(files) > 100:
+        st.error("Please limit your upload to 100 images.")
+    elif st.button(f"Extract Data from {len(files)} Images"):
         if not api_key:
-            st.error("Please enter your API Key in the sidebar first!")
+            st.warning("Please enter your Gemini API Key in the sidebar.")
         else:
-            all_data = []
+            all_extracted_results = []
             progress_bar = st.progress(0)
             status = st.empty()
             
-            total_files = len(uploaded_files)
-            
-            for i in range(0, total_files, BATCH_LIMIT):
-                batch = uploaded_files[i : i + BATCH_LIMIT]
-                status.info(f"Processing batch starting at image {i+1}...")
+            for i in range(0, len(files), BATCH_LIMIT):
+                batch = files[i : i + BATCH_LIMIT]
+                status.info(f"Processing batch {i//BATCH_LIMIT + 1}...")
                 
                 for img_file in batch:
-                    res = process_image(img_file)
+                    res = extract_from_gemini(img_file)
                     if res:
-                        all_data.append(res)
+                        all_extracted_results.append(res)
                     st.session_state.quota_used += 1
                 
-                # Update progress
-                current_progress = min((i + BATCH_LIMIT) / total_files, 1.0)
-                progress_bar.progress(current_progress)
+                # Update UI Progress
+                progress_bar.progress(min((i + BATCH_LIMIT) / len(files), 1.0))
                 
-                # Rate Limiter Pause
-                if i + BATCH_LIMIT < total_files:
-                    status.warning(f"Batch complete. Waiting {PAUSE_TIME}s to respect Free Tier limits...")
+                # Rate Limiter for Free Tier
+                if i + BATCH_LIMIT < len(files):
+                    status.warning("Rate Limiter: Waiting 4 seconds to prevent API crash...")
                     time.sleep(PAUSE_TIME)
-            
-            st.session_state.combined_df = consolidate_data(all_data)
-            status.success("Done! See data below.")
 
+            # Final Consolidation
+            status.info("Consolidating columns and cleaning data...")
+            st.session_state.combined_df = consolidate_data(all_extracted_results)
+            status.success("Processing Complete!")
+
+# --- Display Results ---
 if st.session_state.combined_df is not None:
-    st.divider()
-    st.dataframe(st.session_state.combined_df)
-    
-    csv = st.session_state.combined_df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Unified CSV", data=csv, file_name="extracted_data.csv", mime="text/csv")
+    if not st.session_state.combined_df.empty:
+        st.subheader("📊 Unified Results Table")
+        st.dataframe(st.session_state.combined_df, use_container_width=True)
+        
+        # Download
+        csv = st.session_state.combined_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download CSV", data=csv, file_name="extracted_data.csv", mime="text/csv")
+    else:
+        st.warning("No data could be extracted. Check 'Debug Logs' in the sidebar.")
+
+# --- Debug Section ---
+if st.session_state.debug_logs:
+    with st.expander("See Debug Logs (Errors)"):
+        for log in st.session_state.debug_logs:
+            st.write(log)
